@@ -1,0 +1,1118 @@
+#!/usr/bin/env python3
+"""
+wRecon — Wide Reconnaissance Toolkit
+Multi-source subdomain enumeration, passive URL collection,
+parameter extraction, and live probing.
+
+Systematically wreck your target.
+"""
+
+import sys
+import os
+import json
+import time
+import shutil
+import argparse
+import fnmatch
+import tempfile
+import subprocess
+from pathlib import Path
+from urllib.parse import urlparse, urlsplit
+
+try:
+    import requests
+except ImportError:
+    print("[!] 'requests' not installed. Run: pip3 install requests")
+    sys.exit(1)
+
+
+# ================== COLORS ==================
+class Colors:
+    GRAY    = "\033[90m"
+    GREEN   = "\033[92m"
+    RED     = "\033[91m"
+    YELLOW  = "\033[93m"
+    CYAN    = "\033[96m"
+    MAGENTA = "\033[95m"
+    BLUE    = "\033[94m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    RESET   = "\033[0m"
+
+
+def log_info(msg):  print(f"{Colors.GRAY}[i]{Colors.RESET} {msg}")
+def log_ok(msg):    print(f"{Colors.GREEN}[+]{Colors.RESET} {msg}")
+def log_err(msg):   print(f"{Colors.RED}[!]{Colors.RESET} {msg}")
+def log_warn(msg):  print(f"{Colors.YELLOW}[!]{Colors.RESET} {msg}")
+def log_step(msg):  print(f"\n{Colors.CYAN}{Colors.BOLD}[*] {msg}{Colors.RESET}")
+
+
+# ================== BANNER ==================
+BANNER = r"""
+{c}{b}
+                      ░░░▓▓▓▓▓▓░░░
+                 ░▓█████████████████▓░
+              ▓█████████▓░░     ░░▓▓███░
+            ░███████████▓░            ▓█░
+           ███████▓░                    ░██▓░
+         ░█████▓░░                       █████░
+        ▓█████▓                          ▓█████░
+       ░██████                            ░░████▓
+       ▓█████     ░░░░              ░░░░   ░▓████░
+       ▓████▓░▓██████████▓░░   ░▓██████████▓░████░
+       ░████▓████▓█▓▓▓█████▓░▓██████▓▓▓▓▓██▓ ████
+       ▓████▓░▓██████▓██▓░░   ░░░█▓████▓▓░  ░████░
+       ▓████▓ ░░░░▓▓░  ░▓          ░▓▓░ ░    ████
+       ▓████░                                ███
+       ▓████░                               ░██░
+         ███░           ▓ ░                  █▓
+         ███▓           ▓██░ ░▓░            ░█
+        ░░▓██                               ▓░
+         ▓███▓                             ░█▓░
+          ░░▓█▓    ░▓▓▓▓▓▓▓░░░░░░░░░        ░
+             ▓█▓     ░▓████▓▓▓▓░░
+              ░██▓        ░░░░
+                ░██░
+                  ▓██░               ▓
+                    ░▓█▓▓▓▓▓▓▓▓░░░
+                           ░░░
+{r}{m}                w R e c o n{r}
+{d}            systematically wreck your target.{r}
+""".format(c=Colors.CYAN, b=Colors.BOLD, m=Colors.MAGENTA,
+           d=Colors.DIM, r=Colors.RESET)
+
+
+def print_banner():
+    print(BANNER)
+
+
+# ================== CONFIG (PERSISTENT) ==================
+CONFIG_DIR = Path.home() / ".config" / "wrecon"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def get_or_ask(cfg, key, prompt, optional=False):
+    if key in cfg and cfg[key]:
+        return cfg[key]
+    suffix = " (optional, blank to skip)" if optional else ""
+    val = input(f"{Colors.CYAN}?{Colors.RESET} {prompt}{suffix}: ").strip()
+    if val:
+        cfg[key] = val
+        save_config(cfg)
+        log_ok(f"saved {key} to {CONFIG_FILE}")
+    return val
+
+
+# ================== UTILS ==================
+def run_shell(command, timeout=None):
+    try:
+        proc = subprocess.run(
+            command, shell=True, text=True,
+            capture_output=True, timeout=timeout
+        )
+        return proc.stdout, proc.stderr, proc.returncode
+    except subprocess.TimeoutExpired:
+        return "", "timeout", 124
+
+
+def get_hostname(url):
+    if url.startswith("http"):
+        return urlsplit(url).netloc
+    return url.strip()
+
+
+def good_url(url):
+    extensions = [
+        '.js', '.gif', '.jpg', '.png', '.css', '.woff', '.woff2', '.svg',
+        '.json', '.fnt', '.ogg', '.jpeg', '.img', '.exe', '.mp4', '.flv',
+        '.pdf', '.doc', '.ogv', '.webm', '.wmv', '.webp', '.mov', '.mp3',
+        '.m4a', '.m4p', '.ppt', '.pptx', '.scss', '.tif', '.tiff', '.ttf',
+        '.otf', '.bmp', '.ico', '.eot', '.htc', '.swf', '.rtf', '.image',
+        '.rf', '.txt', '.ml', '.ip', '.map', '.model', '.m3u8', '.dat', '.psd'
+    ]
+    try:
+        path = urlparse(url).path or ""
+        for ext in extensions:
+            if path.endswith(ext):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def generate_temp_file():
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+        return tmp.name
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def normalize_sub(sub, root_domain):
+    sub = sub.strip().lower().rstrip(".")
+    if not sub:
+        return None
+    if "://" in sub:
+        sub = urlparse(sub).hostname or ""
+    if ":" in sub:
+        sub = sub.split(":")[0]
+    if not sub.endswith(root_domain):
+        return None
+    if any(c in sub for c in " \t\n*\"'<>"):
+        return None
+    return sub
+
+
+# ================== INSTALLER ==================
+# Tool metadata: (name, install command, post-install check)
+TOOL_REGISTRY = {
+    "go": {
+        "check_cmd": "go version",
+        "install": (
+            "wget -q https://go.dev/dl/go1.22.5.linux-amd64.tar.gz -O /tmp/go.tgz && "
+            "sudo rm -rf /usr/local/go && "
+            "sudo tar -C /usr/local -xzf /tmp/go.tgz && "
+            "rm /tmp/go.tgz"
+        ),
+        "post": (
+            "grep -q '/usr/local/go/bin' ~/.bashrc || "
+            "echo 'export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH' >> ~/.bashrc"
+        ),
+        "notes": "After install, run: source ~/.bashrc",
+    },
+    "subfinder": {
+        "install": "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+    },
+    "assetfinder": {
+        "install": "go install github.com/tomnomnom/assetfinder@latest",
+    },
+    "amass": {
+        "install": (
+            "cd /tmp && "
+            "wget -q https://github.com/owasp-amass/amass/releases/latest/download/amass_Linux_amd64.zip && "
+            "unzip -oq amass_Linux_amd64.zip && "
+            "sudo mv amass_Linux_amd64/amass /usr/local/bin/ && "
+            "sudo chmod +x /usr/local/bin/amass && "
+            "rm -rf /tmp/amass_Linux_amd64*"
+        ),
+    },
+    "httpx": {
+        "install": "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest",
+        "notes": "Use ProjectDiscovery httpx, not the Python one",
+    },
+    "dnsx": {
+        "install": "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
+    },
+    "waybackurls": {
+        "install": "go install github.com/tomnomnom/waybackurls@latest",
+    },
+    "gau": {
+        "install": "go install github.com/lc/gau/v2/cmd/gau@latest",
+    },
+    "unfurl": {
+        "install": "go install github.com/tomnomnom/unfurl@latest",
+    },
+}
+
+
+def install_tool(name):
+    """Try to install a tool. Returns True on success."""
+    meta = TOOL_REGISTRY.get(name)
+    if not meta:
+        log_err(f"Unknown tool: {name}")
+        return False
+
+    log_step(f"Installing {name}")
+    if meta.get("notes"):
+        log_info(meta["notes"])
+
+    cmd = meta["install"]
+    log_info(f"Exec: {cmd}")
+    proc = subprocess.run(cmd, shell=True)
+
+    if proc.returncode != 0:
+        log_err(f"Install of {name} failed (rc={proc.returncode})")
+        return False
+
+    if meta.get("post"):
+        log_info("Running post-install step")
+        subprocess.run(meta["post"], shell=True)
+
+    # verify
+    if shutil.which(name):
+        log_ok(f"{name} installed → {shutil.which(name)}")
+        return True
+    else:
+        log_warn(f"{name} installed but not in PATH yet. "
+                 f"Try: source ~/.bashrc")
+        return False
+
+
+def check_and_offer_install(tools, interactive=True):
+    """For each tool, if missing, offer to install."""
+    missing = [t for t in tools if shutil.which(t) is None]
+    if not missing:
+        log_ok("All required tools are present.")
+        return True
+
+    log_warn(f"Missing tools: {', '.join(missing)}")
+
+    if not interactive:
+        log_info("Run with interactive mode to install, or install manually.")
+        return False
+
+    for t in missing:
+        if t not in TOOL_REGISTRY:
+            log_warn(f"No installer for '{t}' — install manually")
+            continue
+        if ask_yn(f"Install {t} now?", default=True):
+            install_tool(t)
+        else:
+            log_info(f"Skipped {t}")
+
+    # re-check
+    still_missing = [t for t in tools if shutil.which(t) is None]
+    if still_missing:
+        log_warn(f"Still missing: {', '.join(still_missing)}")
+        log_info("These stages may fail. Reload shell with: source ~/.bashrc")
+        return False
+    log_ok("All tools ready.")
+    return True
+
+
+def dependency_check_menu():
+    """Standalone dep check that user can run from menu."""
+    log_step("Dependency check")
+    all_tools = ["go"] + [t for t in TOOL_REGISTRY if t != "go"]
+    found = []
+    missing = []
+    for t in all_tools:
+        if shutil.which(t):
+            found.append(t)
+            print(f"  {Colors.GREEN}✓{Colors.RESET} {t} "
+                  f"{Colors.DIM}→ {shutil.which(t)}{Colors.RESET}")
+        else:
+            missing.append(t)
+            print(f"  {Colors.RED}✗{Colors.RESET} {t} {Colors.DIM}(missing){Colors.RESET}")
+
+    if missing:
+        print()
+        if ask_yn(f"Install {len(missing)} missing tool(s) now?", default=True):
+            for t in missing:
+                if t in TOOL_REGISTRY:
+                    if ask_yn(f"  Install {t}?", default=True):
+                        install_tool(t)
+
+
+# ================== OOS FILTERING ==================
+def load_oos(path):
+    if not path or not Path(path).exists():
+        return []
+    with open(path) as f:
+        return [l.strip().lower() for l in f
+                if l.strip() and not l.startswith("#")]
+
+
+def is_out_of_scope(sub, oos_patterns):
+    for pattern in oos_patterns:
+        if sub == pattern:
+            return True
+        if "*" in pattern and fnmatch.fnmatch(sub, pattern):
+            return True
+    return False
+
+
+def filter_oos_list(items, oos_patterns, extract_host=None):
+    if not oos_patterns:
+        return list(items), []
+    in_scope, out_of_scope = [], []
+    for item in items:
+        host = extract_host(item) if extract_host else item
+        if host and is_out_of_scope(host.lower(), oos_patterns):
+            out_of_scope.append(item)
+        else:
+            in_scope.append(item)
+    return in_scope, out_of_scope
+
+
+# ================== PASSIVE URL COLLECTION ==================
+def run_passive(domain, output_dir, oos_patterns):
+    log_step(f"Passive URL collection for {domain}")
+
+    temp_file = generate_temp_file()
+    log_info(f"Temp file: {temp_file}")
+
+    commands = [
+        f"echo https://{domain}/ | tee {temp_file}",
+        f"echo {domain} | waybackurls | sort -u | tee -a {temp_file}",
+        f"gau {domain} --threads 1 --subs | sort -u | tee -a {temp_file}",
+    ]
+
+    for cmd in commands:
+        log_info(f"Exec: {cmd}")
+        stdout, stderr, rc = run_shell(cmd, timeout=900)
+        if rc != 0:
+            log_err(f"Command failed ({rc}): {cmd}")
+            if stderr:
+                log_err(stderr.strip()[:300])
+
+    unique_lines = set()
+    with open(temp_file, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if good_url(line):
+                unique_lines.add(line)
+    os.remove(temp_file)
+
+    if not unique_lines:
+        log_err(f"No URLs found for {domain}")
+        return 0
+
+    in_scope, oos_hits = filter_oos_list(
+        unique_lines, oos_patterns,
+        extract_host=lambda u: urlparse(u).hostname or ""
+    )
+
+    ensure_dir(output_dir)
+    out_file = os.path.join(output_dir, "passive.txt")
+    with open(out_file, "w", encoding="utf-8") as f:
+        for u in sorted(in_scope):
+            f.write(u + "\n")
+    log_ok(f"Passive URLs (in-scope): {out_file} ({len(in_scope)} lines)")
+
+    if oos_hits:
+        oos_file = os.path.join(output_dir, "passive_oos.txt")
+        with open(oos_file, "w", encoding="utf-8") as f:
+            for u in sorted(oos_hits):
+                f.write(u + "\n")
+        log_warn(f"Filtered OOS URLs: {len(oos_hits)} → {oos_file}")
+
+    return len(in_scope)
+
+
+# ================== SUBDOMAIN ENUM SOURCES ==================
+def src_subfinder(domain, tmpdir):
+    out = Path(tmpdir) / "subfinder.txt"
+    _, stderr, rc = run_shell(f"subfinder -silent -all -d {domain} -o {out}",
+                              timeout=600)
+    if rc != 0:
+        log_warn(f"subfinder rc={rc}: {stderr.strip()[:200]}")
+    return _read_lines(out)
+
+
+def src_assetfinder(domain, _tmpdir):
+    stdout, _, _ = run_shell(f"assetfinder --subs-only {domain}", timeout=300)
+    return [l for l in stdout.splitlines() if l.strip()]
+
+
+def src_amass(domain, tmpdir):
+    out = Path(tmpdir) / "amass.txt"
+    _, stderr, rc = run_shell(
+        f"amass enum -passive -d {domain} -o {out} -timeout 5",
+        timeout=900
+    )
+    if rc != 0:
+        log_warn(f"amass rc={rc}: {stderr.strip()[:200]}")
+    return _read_lines(out)
+
+
+def src_crtsh(domain):
+    url = f"https://crt.sh/?q=%25.{domain}&output=json"
+    try:
+        r = requests.get(url, timeout=60,
+                         headers={"User-Agent": "Mozilla/5.0 wrecon"})
+        if r.status_code != 200:
+            log_warn(f"crt.sh returned {r.status_code}")
+            return []
+        data = r.json()
+        results = set()
+        for row in data:
+            for field in ("name_value", "common_name"):
+                val = row.get(field, "")
+                for line in val.split("\n"):
+                    results.add(line.strip().lstrip("*."))
+        return list(results)
+    except Exception as e:
+        log_warn(f"crt.sh failed: {e}")
+        return []
+
+
+def src_shodan(domain, api_key):
+    if not api_key:
+        log_warn("SHODAN_API_KEY not set — skipping Shodan")
+        return []
+    url = f"https://api.shodan.io/dns/domain/{domain}?key={api_key}"
+    try:
+        r = requests.get(url, timeout=60)
+        if r.status_code == 401:
+            log_err("Shodan: invalid API key")
+            return []
+        if r.status_code != 200:
+            log_warn(f"Shodan returned {r.status_code}: {r.text[:200]}")
+            return []
+        data = r.json()
+        results = set()
+        for entry in data.get("data", []):
+            sub = entry.get("subdomain", "")
+            results.add(f"{sub}.{domain}" if sub else domain)
+        for s in data.get("subdomains", []):
+            results.add(f"{s}.{domain}")
+        return list(results)
+    except Exception as e:
+        log_warn(f"Shodan failed: {e}")
+        return []
+
+
+def src_wayback(domain):
+    url = (f"http://web.archive.org/cdx/search/cdx?"
+           f"url=*.{domain}/*&output=txt&fl=original&collapse=urlkey")
+    try:
+        r = requests.get(url, timeout=120)
+        if r.status_code != 200:
+            log_warn(f"wayback returned {r.status_code}")
+            return []
+        results = set()
+        for line in r.text.splitlines():
+            try:
+                host = urlparse(line.strip()).hostname
+                if host:
+                    results.add(host)
+            except Exception:
+                continue
+        return list(results)
+    except Exception as e:
+        log_warn(f"wayback failed: {e}")
+        return []
+
+
+def src_alienvault(domain):
+    url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"
+    try:
+        r = requests.get(url, timeout=60)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return [rec.get("hostname", "") for rec in data.get("passive_dns", [])]
+    except Exception as e:
+        log_warn(f"alienvault failed: {e}")
+        return []
+
+
+def src_hackertarget(domain):
+    url = f"https://api.hackertarget.com/hostsearch/?q={domain}"
+    try:
+        r = requests.get(url, timeout=60)
+        if r.status_code != 200 or "API count exceeded" in r.text:
+            return []
+        results = []
+        for line in r.text.splitlines():
+            parts = line.split(",")
+            if parts:
+                results.append(parts[0])
+        return results
+    except Exception as e:
+        log_warn(f"hackertarget failed: {e}")
+        return []
+
+
+def _read_lines(path):
+    if not Path(path).exists():
+        return []
+    with open(path) as f:
+        return [l.strip() for l in f if l.strip()]
+
+
+def run_subdomain_enum(domain, output_dir, shodan_key, oos_patterns,
+                      skip_sources=None):
+    log_step(f"Subdomain enumeration for {domain}")
+    skip_sources = skip_sources or set()
+    sources_results = {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = [
+            ("subfinder",    lambda: src_subfinder(domain, tmpdir)),
+            ("assetfinder",  lambda: src_assetfinder(domain, tmpdir)),
+            ("amass",        lambda: src_amass(domain, tmpdir)),
+            ("crtsh",        lambda: src_crtsh(domain)),
+            ("shodan",       lambda: src_shodan(domain, shodan_key)),
+            ("wayback",      lambda: src_wayback(domain)),
+            ("alienvault",   lambda: src_alienvault(domain)),
+            ("hackertarget", lambda: src_hackertarget(domain)),
+        ]
+
+        for name, fn in registry:
+            if name in skip_sources:
+                log_info(f"skipping {name}")
+                continue
+            print(f"{Colors.CYAN}  → {name}{Colors.RESET}", end="", flush=True)
+            t0 = time.time()
+            try:
+                raw = fn() or []
+            except Exception as e:
+                log_err(f"{name} crashed: {e}")
+                raw = []
+            cleaned = set()
+            for r in raw:
+                n = normalize_sub(r, domain)
+                if n:
+                    cleaned.add(n)
+            sources_results[name] = sorted(cleaned)
+            print(f" {Colors.GREEN}{len(cleaned)}{Colors.RESET} "
+                  f"{Colors.DIM}({time.time()-t0:.1f}s){Colors.RESET}")
+
+    all_subs = set()
+    for subs in sources_results.values():
+        all_subs.update(subs)
+    log_ok(f"Total unique subdomains: {len(all_subs)}")
+
+    in_scope, oos_hits = filter_oos_list(all_subs, oos_patterns)
+
+    ensure_dir(output_dir)
+    (Path(output_dir) / "all_subdomains.txt").write_text(
+        "\n".join(sorted(all_subs)))
+    (Path(output_dir) / "subdomains.txt").write_text(
+        "\n".join(sorted(in_scope)))
+    (Path(output_dir) / "subdomains_oos.txt").write_text(
+        "\n".join(sorted(oos_hits)))
+    (Path(output_dir) / "subdomains_by_source.json").write_text(
+        json.dumps(sources_results, indent=2))
+
+    log_ok(f"In-scope subdomains: {len(in_scope)} → subdomains.txt")
+    if oos_hits:
+        log_warn(f"Filtered OOS: {len(oos_hits)} → subdomains_oos.txt")
+
+    return len(in_scope)
+
+
+# ================== PASSIVEPLUS ==================
+def run_passiveplus(domain, output_dir, threads):
+    passive_file = os.path.join(output_dir, "passive.txt")
+    if not os.path.isfile(passive_file):
+        log_err(f"passive.txt not found in {output_dir}, skip passiveplus")
+        return 0
+
+    log_step(f"PassivePlus probing for {domain}")
+    ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:108.0) "
+          "Gecko/20100101 Firefox/108.0")
+    referer = f"https://{domain}"
+
+    cmd = (
+        f"cat {passive_file} | "
+        f"httpx -silent -follow-host-redirects "
+        f"-title -status-code -cdn -tech-detect "
+        f"-H 'User-Agent: {ua}' -H 'Referer: {referer}' "
+        f"-threads {threads}"
+    )
+
+    log_info(f"Exec: {cmd}")
+    stdout, stderr, rc = run_shell(cmd, timeout=1800)
+
+    if rc != 0 and not stdout:
+        log_err("PassivePlus failed.")
+        if stderr:
+            log_err(stderr.strip()[:300])
+        return 0
+
+    lines = [l for l in stdout.splitlines() if l.strip()]
+    out_file = os.path.join(output_dir, "passiveplus.txt")
+    with open(out_file, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+    log_ok(f"PassivePlus saved: {out_file} ({len(lines)} lines)")
+    return len(lines)
+
+
+# ================== PARAMS ==================
+def extract_params(output_dir):
+    passive_file = os.path.join(output_dir, "passive.txt")
+    if not os.path.isfile(passive_file):
+        log_err(f"passive.txt not found in {output_dir}, skip params")
+        return 0
+
+    log_step("Extracting parameter keys with unfurl")
+    cmd = f"cat {passive_file} | unfurl keys | sort -u"
+    log_info(f"Exec: {cmd}")
+    stdout, stderr, rc = run_shell(cmd, timeout=300)
+
+    if rc != 0 and not stdout:
+        log_err("unfurl failed.")
+        if stderr:
+            log_err(stderr.strip()[:300])
+        return 0
+
+    keys = [l.strip() for l in stdout.splitlines() if l.strip()]
+    if not keys:
+        log_err("No params extracted.")
+        return 0
+
+    out_file = os.path.join(output_dir, "passive_params.txt")
+    with open(out_file, "w", encoding="utf-8") as f:
+        for k in keys:
+            f.write(k + "\n")
+    log_ok(f"Params saved: {out_file} ({len(keys)} keys)")
+    return len(keys)
+
+
+# ================== ACTIVE ==================
+def ensure_resolvers(resolvers_path):
+    if os.path.isfile(resolvers_path):
+        return
+    log_info(f"{resolvers_path} not found, creating default.")
+    with open(resolvers_path, "w") as f:
+        f.write("1.1.1.1\n8.8.8.8\n9.9.9.9\n")
+
+
+def run_active(domain, output_dir, resolvers_path, threads, oos_patterns):
+    log_step(f"Active probing for {domain}")
+    ensure_resolvers(resolvers_path)
+
+    ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:108.0) "
+          "Gecko/20100101 Firefox/108.0")
+    referer = f"https://{domain}"
+
+    subs_file = os.path.join(output_dir, "subdomains.txt")
+    if os.path.isfile(subs_file):
+        log_info(f"Using in-scope subdomains: {subs_file}")
+        feeder = f"cat {subs_file}"
+    else:
+        log_info("No subdomains.txt — running subfinder inline")
+        feeder = f"echo {domain} | subfinder -silent"
+
+    cmd = (
+        f"{feeder} | "
+        f"dnsx -r {resolvers_path} -silent | "
+        f"httpx -silent -follow-host-redirects "
+        f"-title -status-code -cdn -tech-detect "
+        f"-H 'User-Agent: {ua}' -H 'Referer: {referer}' "
+        f"-threads {threads}"
+    )
+
+    log_info(f"Exec: {cmd}")
+    stdout, stderr, rc = run_shell(cmd, timeout=1800)
+
+    if rc != 0 and not stdout:
+        log_err("Active pipeline failed.")
+        if stderr:
+            log_err(stderr.strip()[:300])
+        return 0
+
+    lines = [l for l in stdout.splitlines() if l.strip()]
+
+    if oos_patterns:
+        in_scope, oos_hits = filter_oos_list(
+            lines, oos_patterns,
+            extract_host=lambda l: l.split()[0] if l.split() else ""
+        )
+        lines = in_scope
+        if oos_hits:
+            log_warn(f"Filtered {len(oos_hits)} OOS lines from active output")
+
+    out_file = os.path.join(output_dir, "active.txt")
+    with open(out_file, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+    log_ok(f"Active results saved: {out_file} ({len(lines)} lines)")
+    return len(lines)
+
+
+# ================== INPUT ==================
+def read_targets(domain_arg, input_file):
+    targets = []
+    if not sys.stdin.isatty():
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                targets.append(get_hostname(line))
+    if input_file:
+        with open(input_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    targets.append(get_hostname(line))
+    if domain_arg:
+        targets.append(get_hostname(domain_arg))
+    return sorted(set(targets))
+
+
+# ================== MENU HELPERS ==================
+def ask(prompt, default=None):
+    suffix = f" {Colors.DIM}[{default}]{Colors.RESET}" if default else ""
+    val = input(f"{Colors.CYAN}?{Colors.RESET} {prompt}{suffix}: ").strip()
+    return val or (default or "")
+
+
+def ask_yn(prompt, default=True):
+    d = "Y/n" if default else "y/N"
+    val = input(f"{Colors.CYAN}?{Colors.RESET} {prompt} "
+                f"{Colors.DIM}[{d}]{Colors.RESET}: ").strip().lower()
+    if not val:
+        return default
+    return val.startswith("y")
+
+
+# ================== BACKGROUND EXECUTION ==================
+def relaunch_background(out_dir, project):
+    """
+    Re-exec this script in background using nohup.
+    Returns immediately; the child detaches and survives SSH disconnect.
+    """
+    ensure_dir(out_dir)
+    log_file = os.path.join(out_dir, f"wrecon_{project}.log")
+    pid_file = os.path.join(out_dir, f"wrecon_{project}.pid")
+
+    # rebuild argv without --background to avoid loop
+    new_argv = [sys.executable, os.path.abspath(__file__)]
+    for a in sys.argv[1:]:
+        if a not in ("--background", "-bg"):
+            new_argv.append(a)
+    # mark child as already-in-background
+    new_argv.append("--_bg_child")
+
+    log_info("Detaching to background...")
+    log_info(f"Log file: {log_file}")
+    log_info(f"PID file: {pid_file}")
+
+    with open(log_file, "ab") as out:
+        proc = subprocess.Popen(
+            new_argv,
+            stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach from terminal session
+            close_fds=True,
+        )
+
+    with open(pid_file, "w") as f:
+        f.write(str(proc.pid))
+
+    log_ok(f"Started in background, PID={proc.pid}")
+    print()
+    print(f"{Colors.BOLD}Useful commands:{Colors.RESET}")
+    print(f"  {Colors.DIM}# follow log:{Colors.RESET}")
+    print(f"  tail -f {log_file}")
+    print(f"  {Colors.DIM}# check if still running:{Colors.RESET}")
+    print(f"  ps -p $(cat {pid_file})")
+    print(f"  {Colors.DIM}# stop it:{Colors.RESET}")
+    print(f"  kill $(cat {pid_file})")
+    print()
+    sys.exit(0)
+
+
+# ================== INTERACTIVE MENU ==================
+def interactive_menu():
+    print_banner()
+    print(f"{Colors.BOLD}{Colors.MAGENTA}»» Interactive Mode ««{Colors.RESET}\n")
+
+    cfg = load_config()
+
+    # offer dep check on first run
+    if not cfg.get("deps_checked"):
+        log_info("First run — let's check dependencies.")
+        dependency_check_menu()
+        cfg["deps_checked"] = True
+        save_config(cfg)
+    elif ask_yn("Run dependency check?", default=False):
+        dependency_check_menu()
+
+    print()
+    # project name
+    project = ask("Project name", cfg.get("last_project") or "example")
+    if not project:
+        log_err("Project name is required.")
+        sys.exit(1)
+    cfg["last_project"] = project
+
+    # target domain
+    domain = ask("Target domain",
+                 cfg.get(f"last_domain_{project}") or "example.com")
+    if not domain:
+        log_err("Target domain is required.")
+        sys.exit(1)
+    cfg[f"last_domain_{project}"] = domain
+
+    # output dir
+    default_out = cfg.get("default_output_dir", str(Path.home() / "hunt"))
+    out_base = ask("Base output dir", default_out)
+    cfg["default_output_dir"] = out_base
+    out_dir = os.path.join(out_base, project)
+
+    # oos file
+    default_oos = cfg.get(f"oos_{project}", "")
+    oos_file = ask("Path to out-of-scope file (blank for none)", default_oos)
+    if oos_file:
+        cfg[f"oos_{project}"] = oos_file
+
+    # api keys
+    print(f"\n{Colors.DIM}── API Keys (saved to {CONFIG_FILE}) ──{Colors.RESET}")
+    shodan_key = get_or_ask(cfg, "shodan_api_key",
+                            "Shodan API key", optional=True)
+    save_config(cfg)
+
+    # stages
+    print(f"\n{Colors.BOLD}── Select stages ──{Colors.RESET}")
+    do_subs    = ask_yn("Subdomain enumeration (8 sources)?", True)
+    do_passive = ask_yn("Passive URL collection (waybackurls + gau)?", True)
+    do_params  = ask_yn("Extract parameter keys (unfurl)?", True)
+    do_pplus   = ask_yn("Probe passive URLs with httpx?", False)
+    do_active  = ask_yn("Active probe pipeline (dnsx + httpx)?", True)
+
+    threads_default = str(cfg.get("threads", 25))
+    threads = int(ask("httpx threads", threads_default) or threads_default)
+    cfg["threads"] = threads
+
+    resolvers = ask("Resolvers file", cfg.get("resolvers", "resolvers.txt"))
+    cfg["resolvers"] = resolvers
+    save_config(cfg)
+
+    # background mode
+    print(f"\n{Colors.BOLD}── Execution mode ──{Colors.RESET}")
+    print(f"  {Colors.DIM}Background mode survives SSH disconnection{Colors.RESET}")
+    background = ask_yn("Run in background (survives SSH disconnect)?", False)
+
+    # summary
+    print(f"\n{Colors.BOLD}── Summary ──{Colors.RESET}")
+    print(f"  Project:    {Colors.GREEN}{project}{Colors.RESET}")
+    print(f"  Domain:     {Colors.GREEN}{domain}{Colors.RESET}")
+    print(f"  Output:     {Colors.GREEN}{out_dir}{Colors.RESET}")
+    print(f"  OOS file:   {Colors.GREEN}{oos_file or '(none)'}{Colors.RESET}")
+    print(f"  Threads:    {Colors.GREEN}{threads}{Colors.RESET}")
+    print(f"  Background: {Colors.GREEN}{background}{Colors.RESET}")
+    stages = " ".join(s for s, v in [
+        ("subs", do_subs), ("passive", do_passive), ("params", do_params),
+        ("pplus", do_pplus), ("active", do_active)] if v) or "(none)"
+    print(f"  Stages:     {Colors.GREEN}{stages}{Colors.RESET}")
+
+    if not ask_yn("\nProceed?", True):
+        log_info("Cancelled.")
+        sys.exit(0)
+
+    return {
+        "project": project,
+        "domain": domain,
+        "out_dir": out_dir,
+        "oos_file": oos_file,
+        "shodan_key": shodan_key,
+        "threads": threads,
+        "resolvers": resolvers,
+        "do_subs": do_subs,
+        "do_passive": do_passive,
+        "do_params": do_params,
+        "do_pplus": do_pplus,
+        "do_active": do_active,
+        "background": background,
+    }
+
+
+# ================== EXECUTE ==================
+def execute(opts):
+    domain     = opts["domain"]
+    out_dir    = opts["out_dir"]
+    oos_file   = opts["oos_file"]
+    shodan_key = opts["shodan_key"]
+    threads    = opts["threads"]
+    resolvers  = opts["resolvers"]
+
+    ensure_dir(out_dir)
+    oos_patterns = load_oos(oos_file)
+    if oos_patterns:
+        log_info(f"Loaded {len(oos_patterns)} OOS patterns from {oos_file}")
+
+    print(f"\n{Colors.MAGENTA}{Colors.BOLD}"
+          f"╔══ Running on {domain} ══╗{Colors.RESET}")
+    start = time.time()
+
+    if opts["do_subs"]:
+        run_subdomain_enum(domain, out_dir, shodan_key, oos_patterns)
+
+    if opts["do_passive"]:
+        run_passive(domain, out_dir, oos_patterns)
+
+    if opts["do_params"]:
+        extract_params(out_dir)
+
+    if opts["do_pplus"]:
+        run_passiveplus(domain, out_dir, threads)
+
+    if opts["do_active"]:
+        run_active(domain, out_dir, resolvers, threads, oos_patterns)
+
+    elapsed = time.time() - start
+    print(f"\n{Colors.GREEN}{Colors.BOLD}"
+          f"╚══ Done in {elapsed:.1f}s ══╝{Colors.RESET}")
+    log_ok(f"Output saved in: {out_dir}")
+
+
+# ================== MAIN ==================
+def main():
+    parser = argparse.ArgumentParser(
+        description="WRECON — Recon Toolkit")
+    parser.add_argument("-d", "--domain", help="Single domain")
+    parser.add_argument("-i", "--input", help="File with list of domains")
+    parser.add_argument("-p", "--project", help="Project name")
+    parser.add_argument("-o", "--out-dir", default=None,
+                        help="Base output dir (default: ~/hunt)")
+    parser.add_argument("--oos", help="Out-of-scope file")
+    parser.add_argument("--resolvers", default="resolvers.txt")
+    parser.add_argument("--threads", type=int, default=25)
+    parser.add_argument("--passive",     action="store_true")
+    parser.add_argument("--passiveplus", action="store_true")
+    parser.add_argument("--active",      action="store_true")
+    parser.add_argument("--subs",        action="store_true")
+    parser.add_argument("--params",      action="store_true")
+    parser.add_argument("--all",         action="store_true",
+                        help="Run all stages")
+    parser.add_argument("--background", "-bg", action="store_true",
+                        help="Detach to background (survives SSH disconnect)")
+    parser.add_argument("--no-interactive", action="store_true")
+    parser.add_argument("--reset-config", action="store_true")
+    parser.add_argument("--install-deps", action="store_true",
+                        help="Run dependency installer and exit")
+    parser.add_argument("--_bg_child", action="store_true",
+                        help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    if args.reset_config:
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.unlink()
+            log_ok(f"Removed {CONFIG_FILE}")
+        else:
+            log_info("No config to remove.")
+        sys.exit(0)
+
+    if args.install_deps:
+        print_banner()
+        dependency_check_menu()
+        sys.exit(0)
+
+    # interactive mode
+    cli_used = any([args.domain, args.input, args.no_interactive])
+    if not cli_used:
+        opts = interactive_menu()
+        if opts.get("background") and not args._bg_child:
+            # need to relaunch; the child will skip this branch
+            # build a CLI command from opts so the child runs non-interactively
+            relaunch_with_cli(opts)
+        execute(opts)
+        return
+
+    # CLI mode
+    if not args._bg_child:
+        print_banner()
+    cfg = load_config()
+    targets = read_targets(args.domain, args.input)
+    if not targets:
+        log_err("No targets specified.")
+        parser.print_help()
+        sys.exit(1)
+
+    if not (args.passive or args.passiveplus or args.active
+            or args.subs or args.params or args.all):
+        args.all = True
+    if args.all:
+        args.subs = args.passive = args.params = args.active = True
+
+    out_base = args.out_dir or cfg.get("default_output_dir",
+                                       str(Path.home() / "hunt"))
+    shodan_key = os.environ.get("SHODAN_API_KEY") or cfg.get("shodan_api_key", "")
+
+    # if --background and we're not yet the child, relaunch
+    if args.background and not args._bg_child:
+        project = args.project or targets[0]
+        out_dir = os.path.join(out_base, project)
+        relaunch_background(out_dir, project)
+
+    for t in targets:
+        project = args.project or t
+        out_dir = os.path.join(out_base, project)
+        opts = {
+            "project": project, "domain": t,
+            "out_dir": out_dir, "oos_file": args.oos,
+            "shodan_key": shodan_key, "threads": args.threads,
+            "resolvers": args.resolvers,
+            "do_subs": args.subs, "do_passive": args.passive,
+            "do_params": args.params, "do_pplus": args.passiveplus,
+            "do_active": args.active,
+        }
+        execute(opts)
+
+
+def relaunch_with_cli(opts):
+    """For background mode from interactive menu — re-exec with CLI args."""
+    ensure_dir(opts["out_dir"])
+    project = opts["project"]
+    log_file = os.path.join(opts["out_dir"], f"wrecon_{project}.log")
+    pid_file = os.path.join(opts["out_dir"], f"wrecon_{project}.pid")
+
+    argv = [sys.executable, os.path.abspath(__file__),
+            "-d", opts["domain"],
+            "-p", project,
+            "-o", os.path.dirname(opts["out_dir"]),
+            "--threads", str(opts["threads"]),
+            "--resolvers", opts["resolvers"],
+            "--no-interactive", "--_bg_child"]
+    if opts["oos_file"]:
+        argv += ["--oos", opts["oos_file"]]
+    if opts["do_subs"]:    argv.append("--subs")
+    if opts["do_passive"]: argv.append("--passive")
+    if opts["do_params"]:  argv.append("--params")
+    if opts["do_pplus"]:   argv.append("--passiveplus")
+    if opts["do_active"]:  argv.append("--active")
+
+    log_info("Detaching to background...")
+    log_info(f"Log file: {log_file}")
+    log_info(f"PID file: {pid_file}")
+
+    # pass shodan key via env so it's not in the visible command
+    env = os.environ.copy()
+    if opts["shodan_key"]:
+        env["SHODAN_API_KEY"] = opts["shodan_key"]
+
+    with open(log_file, "ab") as out:
+        proc = subprocess.Popen(
+            argv,
+            stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True, env=env,
+        )
+
+    with open(pid_file, "w") as f:
+        f.write(str(proc.pid))
+
+    log_ok(f"Started in background, PID={proc.pid}")
+    print()
+    print(f"{Colors.BOLD}Useful commands:{Colors.RESET}")
+    print(f"  {Colors.DIM}# follow log:{Colors.RESET}")
+    print(f"  tail -f {log_file}")
+    print(f"  {Colors.DIM}# check if still running:{Colors.RESET}")
+    print(f"  ps -p $(cat {pid_file})")
+    print(f"  {Colors.DIM}# stop it:{Colors.RESET}")
+    print(f"  kill $(cat {pid_file})")
+    print()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Colors.RED}[!] Interrupted{Colors.RESET}")
+        sys.exit(130)
