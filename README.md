@@ -73,7 +73,7 @@ Perfect for bug bounty hunters, penetration testers, and security researchers wh
 ### Quick Install (Recommended)
 
 ```bash
-git clone https://github.com/yourusername/wrecon.git
+git clone https://github.com/FarzadSec/wrecon.git
 cd wrecon
 chmod +x install.sh
 sudo ./install.sh
