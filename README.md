@@ -3,21 +3,21 @@
 **Wide Reconnaissance Toolkit** — Multi-source subdomain enumeration, passive URL collection, parameter extraction, and live probing.
 
 ```
-            ██╗    ██╗██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
-            ██║    ██║██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║
-            ██║ █╗ ██║██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║
-            ██║███╗██║██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║
-            ╚███╔███╔╝██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
-             ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝
+        ██╗    ██╗██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
+        ██║    ██║██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║
+        ██║ █╗ ██║██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║
+        ██║███╗██║██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║
+        ╚███╔███╔╝██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
+         ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝
 
-                wreck the target. systematically.
+            wreck the target. systematically.
 ```
 
 ---
 
 ## 📋 Overview
 
-**wRecon** automates the reconnaissance phase by combining multiple passive and active sources into a single workflow. It handles subdomain enumeration from 8+ sources, collects historical URLs, extracts parameters, and probes live hosts — all with out-of-scope filtering and persistent configuration.
+**wRecon** automates the reconnaissance phase by combining multiple passive and active sources into a single workflow. It handles subdomain enumeration from 8+ sources, collects historical URLs, extracts parameters, and probes live hosts — all with out-of-scope filtering, persistent configuration, and checkpoint-aware resumption.
 
 Perfect for bug bounty hunters, penetration testers, and security researchers who need comprehensive recon without babysitting tools.
 
@@ -53,10 +53,18 @@ Perfect for bug bounty hunters, penetration testers, and security researchers wh
 - Saves API keys, project preferences, and settings to `~/.config/wrecon/`
 - No need to re-enter Shodan keys or OOS files every time
 
-### 🌙 **Background Mode**
-- Detach to background with `--background` or `-bg`
-- Survives SSH disconnection
-- PID and log files for easy monitoring
+### 🖥️ **tmux Integration**
+- Run inside a named tmux session with `--tmux`
+- Session survives SSH disconnection
+- If a session already exists: attach, kill & restart, or quit
+- Session named `wrecon_<project>` for easy identification
+
+### 🧠 **Checkpoint Memory**
+- Tracks completed stages in `.wrecon_state.json` inside the project folder
+- On re-run, skips already-completed stages and asks before re-running
+- Shows previous run summary (stage, result count, timestamp) on startup
+- `--force` to override and re-run everything
+- `--status` to inspect checkpoint state without running anything
 
 ### 🔧 **Interactive + CLI Modes**
 - **Interactive menu** (default) — guided setup, ideal for first-time use
@@ -64,7 +72,8 @@ Perfect for bug bounty hunters, penetration testers, and security researchers wh
 
 ### 🛠️ **Built-in Installer**
 - Checks dependencies, offers to install missing tools
-- Supports: subfinder, assetfinder, amass, httpx, dnsx, waybackurls, gau, unfurl
+- Always installs the latest stable Go version (fetched from go.dev)
+- amass: tries `go install` first, falls back to binary release
 
 ---
 
@@ -73,30 +82,39 @@ Perfect for bug bounty hunters, penetration testers, and security researchers wh
 ### Quick Install (Recommended)
 
 ```bash
-git clone https://github.com/FarzadSec/wrecon.git
+git clone https://github.com/yourusername/wrecon.git
 cd wrecon
 chmod +x install.sh
 sudo ./install.sh
 ```
 
 This will:
-- Install all dependencies (Go tools, Python packages)
-- Place `wrecon` in `/usr/local/bin/`
-- Make it globally accessible via `wrecon` command
+- Install system packages including **tmux**
+- Fetch and install the **latest stable Go** version automatically
+- Install all Go-based recon tools
+- Install amass (via `go install`, with binary release as fallback)
+- Place `wrecon` in `/usr/local/bin/` and make it globally accessible
+
+> The installer looks for `wrecon.py` next to `install.sh`, in the current directory, and falls back to downloading it from GitHub automatically.
 
 ### Manual Install
 
 ```bash
-# 1. Install Python dependencies
+# 1. Install system dependencies (includes tmux)
+sudo apt install wget curl git unzip python3 python3-pip tmux
+
+# 2. Install Python dependencies
 pip3 install requests
 
-# 2. Install Go (if not present)
-wget https://go.dev/dl/go1.22.5.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz
+# 3. Install latest Go
+GO_LATEST=$(curl -fsSL 'https://go.dev/dl/?mode=json' | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); print(next(r['version'] for r in d if r['stable']))")
+curl -fsSL "https://go.dev/dl/${GO_LATEST}.linux-amd64.tar.gz" -o /tmp/go.tgz
+sudo tar -C /usr/local -xzf /tmp/go.tgz
 echo 'export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH' >> ~/.bashrc
 source ~/.bashrc
 
-# 3. Install Go tools
+# 4. Install Go tools
 go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
@@ -105,13 +123,10 @@ go install github.com/tomnomnom/waybackurls@latest
 go install github.com/lc/gau/v2/cmd/gau@latest
 go install github.com/tomnomnom/unfurl@latest
 
-# 4. Install amass (binary release)
-wget https://github.com/owasp-amass/amass/releases/latest/download/amass_Linux_amd64.zip
-unzip amass_Linux_amd64.zip
-sudo mv amass_Linux_amd64/amass /usr/local/bin/
-sudo chmod +x /usr/local/bin/amass
+# 5. Install amass
+go install -v github.com/owasp-amass/amass/v4/...@latest
 
-# 5. Make wrecon globally accessible
+# 6. Make wrecon globally accessible
 sudo cp wrecon.py /usr/local/bin/wrecon
 sudo chmod +x /usr/local/bin/wrecon
 ```
@@ -128,12 +143,11 @@ wrecon
 
 You'll be guided through:
 - Dependency check (first run only)
-- Project name
-- Target domain
+- Project name and target domain
 - Out-of-scope file path
 - API keys (Shodan — saved for future runs)
-- Stage selection (subdomain enum, passive URLs, params, active probes)
-- Background mode option
+- Stage selection
+- tmux session option
 
 **All settings are saved** — next time you run `wrecon`, just press Enter to use defaults.
 
@@ -144,40 +158,49 @@ You'll be guided through:
 #### Basic Usage
 
 ```bash
-# Run all stages on a single domain
+# Run all stages
 wrecon -d example.com --all
 
 # With out-of-scope filtering
 wrecon -d example.com --oos oos.txt --all
 
-# Run specific stages only
+# Specific stages only
 wrecon -d example.com --subs --passive --active
+```
+
+#### tmux Mode
+
+```bash
+# Launch inside a persistent tmux session
+wrecon -d example.com --oos oos.txt --all --tmux
+
+# Attach to a running session
+tmux attach -t wrecon_example
+
+# List all wrecon sessions
+tmux ls | grep wrecon
+
+# Stop a session
+tmux kill-session -t wrecon_example
+```
+
+#### Checkpoint / Resume
+
+```bash
+# Check what stages are already done
+wrecon -d example.com -p example --status
+
+# Resume — skips completed stages, asks before re-running
+wrecon -d example.com --all
+
+# Force re-run everything regardless of checkpoint
+wrecon -d example.com --all --force
 ```
 
 #### Multiple Targets
 
 ```bash
-# From file
-wrecon -i targets.txt --all
-
-# From stdin
-cat targets.txt | wrecon --all
-```
-
-#### Background Mode
-
-```bash
-# Detach to background (survives SSH disconnect)
-wrecon -d example.com --oos oos.txt --all --background
-
-# Monitor progress
-tail -f ~/hunt/example/wrecon_example.log
-
-# Check if still running
-ps -p $(cat ~/hunt/example/wrecon_example.pid)
-
-# Stop it
-kill $(cat ~/hunt/example/wrecon_example.pid)
+wrecon -i targets.txt --all --tmux
 ```
 
 #### Advanced Options
@@ -190,7 +213,7 @@ wrecon -d example.com \
     --threads 50 \
     --resolvers custom_resolvers.txt \
     --subs --passive --params --active \
-    --background
+    --tmux
 ```
 
 ---
@@ -210,8 +233,7 @@ All output is saved to `<output_dir>/<project>/`:
 ├── passive_params.txt          # Extracted parameter keys
 ├── passiveplus.txt             # httpx results on passive URLs (optional)
 ├── active.txt                  # dnsx + httpx live probing results
-├── wrecon_example.log          # Execution log (background mode)
-└── wrecon_example.pid          # Process ID (background mode)
+└── .wrecon_state.json          # Checkpoint: completed stages + timestamps
 ```
 
 ---
@@ -220,24 +242,19 @@ All output is saved to `<output_dir>/<project>/`:
 
 ### Out-of-Scope File Format
 
-Create a text file with one pattern per line. Supports wildcards:
-
 ```
 # example_oos.txt
 *.internal.example.com
 *.db.example.com
 staging.example.com
-admin.example.com
 test-*.example.com
 ```
 
-Lines starting with `#` are comments.
+Lines starting with `#` are comments. Wildcard patterns (`*`) are supported.
 
 ### API Keys
 
 #### Shodan
-
-Set via environment variable or interactive prompt:
 
 ```bash
 export SHODAN_API_KEY="your_key_here"
@@ -247,14 +264,10 @@ Or just run `wrecon` — it will ask once and save to `~/.config/wrecon/config.j
 
 #### subfinder (Optional but Recommended)
 
-subfinder can use multiple API keys for better results. Configure once:
-
 ```bash
-subfinder -d example.com  # Creates config file on first run
+subfinder -d example.com   # creates config on first run
 nano ~/.config/subfinder/provider-config.yaml
 ```
-
-Add your keys:
 
 ```yaml
 shodan:
@@ -273,46 +286,50 @@ github:
 
 | Stage | Flag | Description |
 |-------|------|-------------|
-| **Subdomain Enumeration** | `--subs` | Multi-source passive subdomain discovery |
+| **Subdomain Enumeration** | `--subs` | 8-source passive subdomain discovery |
 | **Passive URL Collection** | `--passive` | waybackurls + gau |
 | **Parameter Extraction** | `--params` | Extract URL parameter keys with unfurl |
 | **PassivePlus** | `--passiveplus` | Probe passive URLs with httpx |
 | **Active Probing** | `--active` | dnsx + httpx pipeline on discovered subdomains |
 
-Use `--all` to run all stages (recommended).
+Use `--all` to run all stages.
 
 ---
 
-## 🛠️ Dependency Management
+## 🛠️ All Flags
 
-### Check Dependencies
-
-```bash
-wrecon --install-deps
-```
-
-This runs an interactive installer that:
-1. Checks which tools are present
-2. Offers to install missing ones
-3. Handles Go, subfinder, assetfinder, amass, httpx, dnsx, waybackurls, gau, unfurl
-
-### Reset Configuration
-
-```bash
-wrecon --reset-config
-```
-
-Deletes `~/.config/wrecon/config.json` — useful if you want to start fresh.
+| Flag | Description |
+|------|-------------|
+| `-d DOMAIN` | Single target domain |
+| `-i FILE` | File with list of domains |
+| `-p NAME` | Project name |
+| `-o DIR` | Base output directory (default: `~/hunt`) |
+| `--oos FILE` | Out-of-scope patterns file |
+| `--threads N` | httpx thread count (default: 25) |
+| `--resolvers FILE` | Custom DNS resolvers file |
+| `--all` | Run all stages |
+| `--subs` | Subdomain enumeration only |
+| `--passive` | Passive URL collection only |
+| `--params` | Parameter extraction only |
+| `--passiveplus` | PassivePlus probing only |
+| `--active` | Active probing only |
+| `--tmux` | Run inside a named tmux session |
+| `--force` | Ignore checkpoint, re-run all stages |
+| `--status` | Show checkpoint status and exit |
+| `--install-deps` | Run dependency installer and exit |
+| `--reset-config` | Delete saved configuration and exit |
 
 ---
 
 ## 🔥 Example Workflow
 
 ```bash
-# 1. First run — install deps, set up config
-wrecon --install-deps
+# 1. Clone and install
+git clone https://github.com/yourusername/wrecon.git
+cd wrecon && sudo ./install.sh
+source ~/.bashrc
 
-# 2. Set API key (one-time)
+# 2. Set Shodan API key (one-time)
 export SHODAN_API_KEY="your_key_here"
 
 # 3. Create out-of-scope file
@@ -326,29 +343,28 @@ community-stage.fivetran.com
 trust.fivetran.com
 EOF
 
-# 4. Run full recon in background
+# 4. Run full recon inside tmux
 wrecon -d fivetran.com \
     -p fivetran \
     --oos fivetran_oos.txt \
     --all \
-    --background
+    --tmux
 
-# 5. Monitor
-tail -f ~/hunt/fivetran/wrecon_fivetran.log
+# 5. Attach to watch progress
+tmux attach -t wrecon_fivetran
 
-# 6. When complete, review results
-cat ~/hunt/fivetran/subdomains.txt | wc -l
-head ~/hunt/fivetran/active.txt
+# 6. Check status later (without re-running)
+wrecon -d fivetran.com -p fivetran --status
+
+# 7. Resume if interrupted (skips done stages)
+wrecon -d fivetran.com -p fivetran --oos fivetran_oos.txt --all
 ```
 
 ---
 
 ## 🤝 Contributing
 
-Contributions are welcome! Feel free to:
-- Report bugs
-- Suggest features
-- Submit pull requests
+Contributions are welcome! Feel free to report bugs, suggest features, or submit pull requests.
 
 ---
 
@@ -377,12 +393,7 @@ This tool is intended for authorized security testing and research only. Always 
 - [gau](https://github.com/lc/gau) — lc
 - [unfurl](https://github.com/tomnomnom/unfurl) — Tom Hudson
 
-Plus public APIs:
-- [crt.sh](https://crt.sh) — Certificate Transparency
-- [Shodan](https://shodan.io)
-- [Wayback Machine](https://web.archive.org)
-- [AlienVault OTX](https://otx.alienvault.com)
-- [HackerTarget](https://hackertarget.com)
+Plus public APIs: [crt.sh](https://crt.sh), [Shodan](https://shodan.io), [Wayback Machine](https://web.archive.org), [AlienVault OTX](https://otx.alienvault.com), [HackerTarget](https://hackertarget.com)
 
 ---
 
