@@ -155,42 +155,85 @@ step "amass"
 if command -v amass &>/dev/null; then
     ok "amass already installed → $(which amass)"
 else
-    info "Downloading amass binary..."
-    cd /tmp
-    AMASS_URL=$(curl -fsSL https://api.github.com/repos/owasp-amass/amass/releases/latest \
-        | python3 -c "import sys,json; d=json.load(sys.stdin); \
-          print(next(a['browser_download_url'] for a in d['assets'] \
-          if 'Linux_amd64' in a['name'] and a['name'].endswith('.zip')))" \
-        2>/dev/null || echo "")
-
-    if [[ -n "$AMASS_URL" ]]; then
-        wget -q "$AMASS_URL" -O amass.zip
-        unzip -oq amass.zip
-        AMASS_BIN=$(find /tmp -name "amass" -type f | head -1)
-        if [[ -n "$AMASS_BIN" ]]; then
-            mv "$AMASS_BIN" /usr/local/bin/amass
-            chmod +x /usr/local/bin/amass
-            rm -rf /tmp/amass*
-            ok "amass installed → /usr/local/bin/amass"
-        else
-            warn "amass binary not found in archive"
-        fi
+    # Method 1: go install (fastest, most reliable)
+    info "Installing amass via go install..."
+    if sudo -u "$ACTUAL_USER" env GOPATH="$GOPATH" \
+        PATH="/usr/local/go/bin:$PATH" \
+        go install -v github.com/owasp-amass/amass/v4/...@latest 2>/dev/null \
+        && [[ -f "$GOPATH/bin/amass" ]]; then
+        ln -sf "$GOPATH/bin/amass" /usr/local/bin/amass
+        ok "amass installed via go install"
     else
-        warn "Could not fetch amass release URL — install manually"
+        # Method 2: GitHub release binary
+        info "go install failed, trying binary release..."
+        cd /tmp
+        AMASS_TAG=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/owasp-amass/amass/releases/latest" \
+            2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+
+        if [[ -n "$AMASS_TAG" ]]; then
+            AMASS_URL="https://github.com/owasp-amass/amass/releases/download/${AMASS_TAG}/amass_Linux_amd64.zip"
+            info "Downloading amass ${AMASS_TAG}..."
+            if curl -fsSL "$AMASS_URL" -o amass.zip; then
+                unzip -oq amass.zip
+                AMASS_BIN=$(find /tmp -maxdepth 3 -name "amass" -type f 2>/dev/null | head -1)
+                if [[ -n "$AMASS_BIN" ]]; then
+                    mv "$AMASS_BIN" /usr/local/bin/amass
+                    chmod +x /usr/local/bin/amass
+                    rm -rf /tmp/amass*
+                    ok "amass ${AMASS_TAG} installed → /usr/local/bin/amass"
+                else
+                    warn "amass binary not found in archive"
+                fi
+            else
+                warn "Download failed"
+            fi
+        else
+            warn "Could not resolve amass release tag from GitHub API"
+        fi
+
+        if ! command -v amass &>/dev/null; then
+            warn "amass could not be installed automatically."
+            warn "Install manually: https://github.com/owasp-amass/amass/releases"
+        fi
     fi
 fi
 
 # ── 6. wrecon ───────────────────────────────────────────────────────────────
 step "wRecon"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WRECON_SRC=""
 
-if [[ ! -f "$SCRIPT_DIR/wrecon.py" ]]; then
-    err "wrecon.py not found in $SCRIPT_DIR"
-    err "Run this script from the wrecon repository directory."
-    exit 1
+# Priority 1: wrecon.py next to this install.sh
+if [[ -f "$SCRIPT_DIR/wrecon.py" ]]; then
+    WRECON_SRC="$SCRIPT_DIR/wrecon.py"
+    info "Found wrecon.py in $SCRIPT_DIR"
 fi
 
-install -m 0755 "$SCRIPT_DIR/wrecon.py" /usr/local/bin/wrecon
+# Priority 2: current working directory
+if [[ -z "$WRECON_SRC" && -f "$(pwd)/wrecon.py" ]]; then
+    WRECON_SRC="$(pwd)/wrecon.py"
+    info "Found wrecon.py in $(pwd)"
+fi
+
+# Priority 3: download from GitHub
+if [[ -z "$WRECON_SRC" ]]; then
+    warn "wrecon.py not found locally — downloading from GitHub..."
+    GITHUB_RAW="https://raw.githubusercontent.com/yourusername/wrecon/main/wrecon.py"
+    if curl -fsSL "$GITHUB_RAW" -o /tmp/wrecon.py 2>/dev/null; then
+        WRECON_SRC="/tmp/wrecon.py"
+        ok "Downloaded wrecon.py from GitHub"
+    else
+        err "Could not find or download wrecon.py"
+        err "Run this script from the wrecon repo directory:"
+        err "  git clone https://github.com/yourusername/wrecon.git"
+        err "  cd wrecon && sudo ./install.sh"
+        exit 1
+    fi
+fi
+
+install -m 0755 "$WRECON_SRC" /usr/local/bin/wrecon
 ok "wrecon installed → /usr/local/bin/wrecon"
 
 # ── 7. Verify ───────────────────────────────────────────────────────────────
