@@ -167,7 +167,13 @@ TOOL_REGISTRY = {
     "go": {
         "check_cmd": "go version",
         "install": (
-            "wget -q https://go.dev/dl/go1.22.5.linux-amd64.tar.gz -O /tmp/go.tgz && "
+            "_go_latest=$(curl -fsSL 'https://go.dev/dl/?mode=json' | "
+            "python3 -c \"import sys,json; d=json.load(sys.stdin); "
+            "print(next(r['version'] for r in d if r['stable']))\" "
+            "2>/dev/null || echo 'go1.23.0') && "
+            "echo \"[*] Installing ${_go_latest}\" && "
+            "curl -fsSL https://go.dev/dl/${_go_latest}.linux-amd64.tar.gz "
+            "-o /tmp/go.tgz && "
             "sudo rm -rf /usr/local/go && "
             "sudo tar -C /usr/local -xzf /tmp/go.tgz && "
             "rm /tmp/go.tgz"
@@ -750,50 +756,176 @@ def ask_yn(prompt, default=True):
     return val.startswith("y")
 
 
-# ================== BACKGROUND EXECUTION ==================
-def relaunch_background(out_dir, project):
-    """
-    Re-exec this script in background using nohup.
-    Returns immediately; the child detaches and survives SSH disconnect.
-    """
-    ensure_dir(out_dir)
-    log_file = os.path.join(out_dir, f"wrecon_{project}.log")
-    pid_file = os.path.join(out_dir, f"wrecon_{project}.pid")
+# ================== TMUX EXECUTION ==================
+def check_tmux():
+    """Check if tmux is available."""
+    if not shutil.which("tmux"):
+        log_err("tmux is not installed.")
+        log_info("Install it with:  sudo apt install tmux")
+        return False
+    return True
 
-    # rebuild argv without --background to avoid loop
-    new_argv = [sys.executable, os.path.abspath(__file__)]
-    for a in sys.argv[1:]:
-        if a not in ("--background", "-bg"):
-            new_argv.append(a)
-    # mark child as already-in-background
-    new_argv.append("--_bg_child")
 
-    log_info("Detaching to background...")
-    log_info(f"Log file: {log_file}")
-    log_info(f"PID file: {pid_file}")
+def build_cli_argv(opts):
+    """Build CLI argv list from opts dict (for launching inside tmux)."""
+    import shlex
+    argv = [sys.executable, os.path.abspath(__file__),
+            "-d", opts["domain"],
+            "-p", opts["project"],
+            "-o", os.path.dirname(opts["out_dir"]),
+            "--threads", str(opts["threads"]),
+            "--resolvers", opts["resolvers"],
+            "--no-interactive"]
+    if opts.get("oos_file"):
+        argv += ["--oos", opts["oos_file"]]
+    if opts.get("do_subs"):    argv.append("--subs")
+    if opts.get("do_passive"): argv.append("--passive")
+    if opts.get("do_params"):  argv.append("--params")
+    if opts.get("do_pplus"):   argv.append("--passiveplus")
+    if opts.get("do_active"):  argv.append("--active")
+    return argv
 
-    with open(log_file, "ab") as out:
-        proc = subprocess.Popen(
-            new_argv,
-            stdout=out, stderr=out, stdin=subprocess.DEVNULL,
-            start_new_session=True,  # detach from terminal session
-            close_fds=True,
-        )
 
-    with open(pid_file, "w") as f:
-        f.write(str(proc.pid))
+def launch_tmux(opts):
+    """Launch wrecon inside a named tmux session."""
+    if not check_tmux():
+        sys.exit(1)
 
-    log_ok(f"Started in background, PID={proc.pid}")
+    session = f"wrecon_{opts['project']}"
+    ensure_dir(opts["out_dir"])
+
+    # Check if session already exists
+    exists = subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        capture_output=True
+    ).returncode == 0
+
+    if exists:
+        log_warn(f"tmux session '{session}' already exists.")
+        print(f"  {Colors.DIM}It may still be running from a previous invocation.{Colors.RESET}")
+        choice = input(
+            f"{Colors.CYAN}?{Colors.RESET} "
+            f"[a]ttach / [k]ill and restart / [q]uit: "
+        ).strip().lower()
+        if choice.startswith("a"):
+            os.execvp("tmux", ["tmux", "attach", "-t", session])
+        elif choice.startswith("k"):
+            subprocess.run(["tmux", "kill-session", "-t", session])
+            log_ok(f"Killed session '{session}'. Restarting...")
+        else:
+            log_info("Cancelled.")
+            sys.exit(0)
+
+    # Build the command string to run inside tmux
+    import shlex
+    argv = build_cli_argv(opts)
+    env_prefix = ""
+    if opts.get("shodan_key"):
+        env_prefix = f"SHODAN_API_KEY={shlex.quote(opts['shodan_key'])} "
+    cmd_str = env_prefix + " ".join(shlex.quote(a) for a in argv)
+
+    # Create new detached session
+    subprocess.run([
+        "tmux", "new-session", "-d",
+        "-s", session,
+        "-x", "220", "-y", "50"
+    ], check=True)
+
+    # Send the command to the session
+    subprocess.run([
+        "tmux", "send-keys", "-t", session,
+        cmd_str, "Enter"
+    ], check=True)
+
+    log_ok(f"Started in tmux session: {Colors.BOLD}{session}{Colors.RESET}")
     print()
     print(f"{Colors.BOLD}Useful commands:{Colors.RESET}")
-    print(f"  {Colors.DIM}# follow log:{Colors.RESET}")
-    print(f"  tail -f {log_file}")
-    print(f"  {Colors.DIM}# check if still running:{Colors.RESET}")
-    print(f"  ps -p $(cat {pid_file})")
-    print(f"  {Colors.DIM}# stop it:{Colors.RESET}")
-    print(f"  kill $(cat {pid_file})")
+    print(f"  {Colors.CYAN}tmux attach -t {session}{Colors.RESET}"
+          f"          {Colors.DIM}# attach to session{Colors.RESET}")
+    print(f"  {Colors.CYAN}tmux kill-session -t {session}{Colors.RESET}"
+          f"     {Colors.DIM}# stop the session{Colors.RESET}")
+    print(f"  {Colors.CYAN}tmux ls{Colors.RESET}"
+          f"                           {Colors.DIM}# list all sessions{Colors.RESET}")
     print()
     sys.exit(0)
+
+
+# ================== CHECKPOINT / MEMORY ==================
+STATE_FILENAME = ".wrecon_state.json"
+
+
+def _state_path(out_dir):
+    return os.path.join(out_dir, STATE_FILENAME)
+
+
+def load_state(out_dir):
+    p = _state_path(out_dir)
+    if not os.path.exists(p):
+        return {}
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return {}
+
+
+def save_state(out_dir, state):
+    ensure_dir(out_dir)
+    state["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    Path(_state_path(out_dir)).write_text(json.dumps(state, indent=2))
+
+
+def mark_done(out_dir, stage, count=0):
+    state = load_state(out_dir)
+    state.setdefault("stages", {})[stage] = {
+        "done": True,
+        "count": count,
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_state(out_dir, state)
+
+
+def is_done(out_dir, stage):
+    return load_state(out_dir).get("stages", {}).get(stage, {}).get("done", False)
+
+
+def show_state(out_dir, domain):
+    state = load_state(out_dir)
+    stages = state.get("stages", {})
+    if not stages:
+        return
+    print(f"\n{Colors.BOLD}── Previous run found for {domain} ──{Colors.RESET}")
+    stage_labels = {
+        "subs":    "Subdomain enum",
+        "passive": "Passive URLs",
+        "params":  "Parameters",
+        "pplus":   "PassivePlus",
+        "active":  "Active probe",
+    }
+    for key, label in stage_labels.items():
+        info = stages.get(key)
+        if info and info.get("done"):
+            ts    = info.get("finished_at", "?")
+            count = info.get("count", "?")
+            print(f"  {Colors.GREEN}✓{Colors.RESET} {label:<18}"
+                  f"{Colors.DIM}{count} results  @ {ts}{Colors.RESET}")
+        else:
+            print(f"  {Colors.DIM}○ {label}{Colors.RESET}")
+    print()
+
+
+def should_run(out_dir, stage, force=False):
+    """
+    Return True if the stage should run.
+    If already done and not forced, ask user whether to re-run.
+    """
+    if force or not is_done(out_dir, stage):
+        return True
+    info = load_state(out_dir).get("stages", {}).get(stage, {})
+    ts    = info.get("finished_at", "?")
+    count = info.get("count", "?")
+    log_warn(f"Stage '{stage}' already done: {count} results @ {ts}")
+    return ask_yn(f"  Re-run {stage}?", default=False)
+
 
 
 # ================== INTERACTIVE MENU ==================
@@ -862,10 +994,13 @@ def interactive_menu():
     cfg["resolvers"] = resolvers
     save_config(cfg)
 
-    # background mode
+    # tmux mode
     print(f"\n{Colors.BOLD}── Execution mode ──{Colors.RESET}")
-    print(f"  {Colors.DIM}Background mode survives SSH disconnection{Colors.RESET}")
-    background = ask_yn("Run in background (survives SSH disconnect)?", False)
+    print(f"  {Colors.DIM}tmux mode runs in a persistent session that survives SSH disconnect{Colors.RESET}")
+    use_tmux = ask_yn("Run inside tmux session?", False)
+    if use_tmux and not shutil.which("tmux"):
+        log_warn("tmux not found. Install with: sudo apt install tmux")
+        use_tmux = False
 
     # summary
     print(f"\n{Colors.BOLD}── Summary ──{Colors.RESET}")
@@ -874,7 +1009,7 @@ def interactive_menu():
     print(f"  Output:     {Colors.GREEN}{out_dir}{Colors.RESET}")
     print(f"  OOS file:   {Colors.GREEN}{oos_file or '(none)'}{Colors.RESET}")
     print(f"  Threads:    {Colors.GREEN}{threads}{Colors.RESET}")
-    print(f"  Background: {Colors.GREEN}{background}{Colors.RESET}")
+    print(f"  tmux:       {Colors.GREEN}{use_tmux}{Colors.RESET}")
     stages = " ".join(s for s, v in [
         ("subs", do_subs), ("passive", do_passive), ("params", do_params),
         ("pplus", do_pplus), ("active", do_active)] if v) or "(none)"
@@ -897,7 +1032,7 @@ def interactive_menu():
         "do_params": do_params,
         "do_pplus": do_pplus,
         "do_active": do_active,
-        "background": background,
+        "use_tmux": use_tmux,
     }
 
 
@@ -909,41 +1044,59 @@ def execute(opts):
     shodan_key = opts["shodan_key"]
     threads    = opts["threads"]
     resolvers  = opts["resolvers"]
+    force      = opts.get("force", False)
 
     ensure_dir(out_dir)
     oos_patterns = load_oos(oos_file)
     if oos_patterns:
         log_info(f"Loaded {len(oos_patterns)} OOS patterns from {oos_file}")
 
+    # Show previous run state if any
+    show_state(out_dir, domain)
+
+    # Init state domain
+    state = load_state(out_dir)
+    if not state.get("domain"):
+        state["domain"] = domain
+        save_state(out_dir, state)
+
     print(f"\n{Colors.MAGENTA}{Colors.BOLD}"
           f"╔══ Running on {domain} ══╗{Colors.RESET}")
     start = time.time()
 
-    if opts["do_subs"]:
-        run_subdomain_enum(domain, out_dir, shodan_key, oos_patterns)
+    if opts["do_subs"] and should_run(out_dir, "subs", force):
+        count = run_subdomain_enum(domain, out_dir, shodan_key, oos_patterns)
+        mark_done(out_dir, "subs", count)
 
-    if opts["do_passive"]:
-        run_passive(domain, out_dir, oos_patterns)
+    if opts["do_passive"] and should_run(out_dir, "passive", force):
+        count = run_passive(domain, out_dir, oos_patterns)
+        mark_done(out_dir, "passive", count)
 
-    if opts["do_params"]:
-        extract_params(out_dir)
+    if opts["do_params"] and should_run(out_dir, "params", force):
+        count = extract_params(out_dir)
+        mark_done(out_dir, "params", count)
 
-    if opts["do_pplus"]:
-        run_passiveplus(domain, out_dir, threads)
+    if opts["do_pplus"] and should_run(out_dir, "pplus", force):
+        count = run_passiveplus(domain, out_dir, threads)
+        mark_done(out_dir, "pplus", count)
 
-    if opts["do_active"]:
-        run_active(domain, out_dir, resolvers, threads, oos_patterns)
+    if opts["do_active"] and should_run(out_dir, "active", force):
+        count = run_active(domain, out_dir, resolvers, threads, oos_patterns)
+        mark_done(out_dir, "active", count)
 
     elapsed = time.time() - start
     print(f"\n{Colors.GREEN}{Colors.BOLD}"
           f"╚══ Done in {elapsed:.1f}s ══╝{Colors.RESET}")
     log_ok(f"Output saved in: {out_dir}")
+    # Show final state summary
+    show_state(out_dir, domain)
+
 
 
 # ================== MAIN ==================
 def main():
     parser = argparse.ArgumentParser(
-        description="WRECON — Recon Toolkit")
+        description="wRecon — Wide Reconnaissance Toolkit")
     parser.add_argument("-d", "--domain", help="Single domain")
     parser.add_argument("-i", "--input", help="File with list of domains")
     parser.add_argument("-p", "--project", help="Project name")
@@ -959,14 +1112,16 @@ def main():
     parser.add_argument("--params",      action="store_true")
     parser.add_argument("--all",         action="store_true",
                         help="Run all stages")
-    parser.add_argument("--background", "-bg", action="store_true",
-                        help="Detach to background (survives SSH disconnect)")
+    parser.add_argument("--tmux", action="store_true",
+                        help="Run inside a tmux session (survives SSH disconnect)")
+    parser.add_argument("--force", action="store_true",
+                        help="Force re-run all stages (ignore checkpoint)")
+    parser.add_argument("--status", action="store_true",
+                        help="Show checkpoint status for a project and exit")
     parser.add_argument("--no-interactive", action="store_true")
     parser.add_argument("--reset-config", action="store_true")
     parser.add_argument("--install-deps", action="store_true",
                         help="Run dependency installer and exit")
-    parser.add_argument("--_bg_child", action="store_true",
-                        help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -987,16 +1142,13 @@ def main():
     cli_used = any([args.domain, args.input, args.no_interactive])
     if not cli_used:
         opts = interactive_menu()
-        if opts.get("background") and not args._bg_child:
-            # need to relaunch; the child will skip this branch
-            # build a CLI command from opts so the child runs non-interactively
-            relaunch_with_cli(opts)
+        if opts.get("use_tmux"):
+            launch_tmux(opts)  # exits
         execute(opts)
         return
 
     # CLI mode
-    if not args._bg_child:
-        print_banner()
+    print_banner()
     cfg = load_config()
     targets = read_targets(args.domain, args.input)
     if not targets:
@@ -1014,15 +1166,15 @@ def main():
                                        str(Path.home() / "hunt"))
     shodan_key = os.environ.get("SHODAN_API_KEY") or cfg.get("shodan_api_key", "")
 
-    # if --background and we're not yet the child, relaunch
-    if args.background and not args._bg_child:
-        project = args.project or targets[0]
-        out_dir = os.path.join(out_base, project)
-        relaunch_background(out_dir, project)
-
     for t in targets:
         project = args.project or t
         out_dir = os.path.join(out_base, project)
+
+        # --status: just print checkpoint and exit
+        if args.status:
+            show_state(out_dir, t)
+            sys.exit(0)
+
         opts = {
             "project": project, "domain": t,
             "out_dir": out_dir, "oos_file": args.oos,
@@ -1031,62 +1183,14 @@ def main():
             "do_subs": args.subs, "do_passive": args.passive,
             "do_params": args.params, "do_pplus": args.passiveplus,
             "do_active": args.active,
+            "force": args.force,
         }
+
+        # --tmux: launch inside tmux session
+        if args.tmux:
+            launch_tmux(opts)  # exits
+
         execute(opts)
-
-
-def relaunch_with_cli(opts):
-    """For background mode from interactive menu — re-exec with CLI args."""
-    ensure_dir(opts["out_dir"])
-    project = opts["project"]
-    log_file = os.path.join(opts["out_dir"], f"wrecon_{project}.log")
-    pid_file = os.path.join(opts["out_dir"], f"wrecon_{project}.pid")
-
-    argv = [sys.executable, os.path.abspath(__file__),
-            "-d", opts["domain"],
-            "-p", project,
-            "-o", os.path.dirname(opts["out_dir"]),
-            "--threads", str(opts["threads"]),
-            "--resolvers", opts["resolvers"],
-            "--no-interactive", "--_bg_child"]
-    if opts["oos_file"]:
-        argv += ["--oos", opts["oos_file"]]
-    if opts["do_subs"]:    argv.append("--subs")
-    if opts["do_passive"]: argv.append("--passive")
-    if opts["do_params"]:  argv.append("--params")
-    if opts["do_pplus"]:   argv.append("--passiveplus")
-    if opts["do_active"]:  argv.append("--active")
-
-    log_info("Detaching to background...")
-    log_info(f"Log file: {log_file}")
-    log_info(f"PID file: {pid_file}")
-
-    # pass shodan key via env so it's not in the visible command
-    env = os.environ.copy()
-    if opts["shodan_key"]:
-        env["SHODAN_API_KEY"] = opts["shodan_key"]
-
-    with open(log_file, "ab") as out:
-        proc = subprocess.Popen(
-            argv,
-            stdout=out, stderr=out, stdin=subprocess.DEVNULL,
-            start_new_session=True, close_fds=True, env=env,
-        )
-
-    with open(pid_file, "w") as f:
-        f.write(str(proc.pid))
-
-    log_ok(f"Started in background, PID={proc.pid}")
-    print()
-    print(f"{Colors.BOLD}Useful commands:{Colors.RESET}")
-    print(f"  {Colors.DIM}# follow log:{Colors.RESET}")
-    print(f"  tail -f {log_file}")
-    print(f"  {Colors.DIM}# check if still running:{Colors.RESET}")
-    print(f"  ps -p $(cat {pid_file})")
-    print(f"  {Colors.DIM}# stop it:{Colors.RESET}")
-    print(f"  kill $(cat {pid_file})")
-    print()
-    sys.exit(0)
 
 
 if __name__ == "__main__":
