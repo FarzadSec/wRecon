@@ -11,7 +11,9 @@ import sys
 import os
 import json
 import time
+import shlex
 import shutil
+import signal
 import argparse
 import fnmatch
 import tempfile
@@ -102,14 +104,62 @@ def get_or_ask(cfg, key, prompt, optional=False):
 
 # ================== UTILS ==================
 def run_shell(command, timeout=None):
+    # Runs in its own process group (setsid) so that on timeout we can kill
+    # the ENTIRE pipeline (e.g. `gau ... | sort -u | tee ...`), not just the
+    # shell wrapper. subprocess.run()'s own timeout handling only signals the
+    # immediate child (the shell); any command it spawned via a pipe survives
+    # as an orphan and keeps running/holding memory+sockets. On a small,
+    # no-swap box, enough orphaned long-poll HTTP tools from repeated timeouts
+    # (e.g. a hung archive.org CDX request) is what turns "one slow provider"
+    # into a real OOM over the course of a multi-stage/multi-host run.
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command, shell=True, text=True,
-            capture_output=True, timeout=timeout
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-        return proc.stdout, proc.stderr, proc.returncode
-    except subprocess.TimeoutExpired:
-        return "", "timeout", 124
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return stdout, stderr, proc.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()  # reap, discard any partial buffered output
+            return "", "timeout", 124
+    except Exception as e:
+        return "", str(e), 1
+
+
+def run_shell_to_file(command, out_path, timeout=None, append=False):
+    # For commands whose stdout can be large (gau/waybackurls archive dumps,
+    # `unfurl keys` over a big passive.txt): redirect straight to disk via the
+    # shell instead of capturing through a Python PIPE. capture_output=True
+    # holds the ENTIRE stdout as an in-memory str/bytes object regardless of
+    # whether the caller ever reads it — on a target with a few thousand
+    # subdomains, a full historical URL dump can be hundreds of MB to
+    # multiple GB, which is enough alone to OOM a small box, doubly so if
+    # nothing was reading it, only to be reloaded straight back off the file
+    # tee'd to disk. Streaming to a file keeps Python's own memory flat
+    # regardless of output size; only the shell's own (much smaller) I/O
+    # buffers are in play.
+    redirect = ">>" if append else ">"
+    full_cmd = f"({command}) {redirect} {out_path}"
+    try:
+        proc = subprocess.Popen(full_cmd, shell=True, start_new_session=True)
+        try:
+            proc.wait(timeout=timeout)
+            return proc.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            return 124
+    except Exception:
+        return 1
 
 
 def get_hostname(url):
@@ -346,19 +396,52 @@ def run_passive(domain, output_dir, oos_patterns):
     temp_file = generate_temp_file()
     log_info(f"Temp file: {temp_file}")
 
-    commands = [
-        f"echo https://{domain}/ | tee {temp_file}",
-        f"echo {domain} | waybackurls | sort -u | tee -a {temp_file}",
-        f"gau {domain} --threads 1 --subs | sort -u | tee -a {temp_file}",
+    # archive.org's CDX API is the data source behind BOTH `waybackurls` and
+    # gau's own "wayback" provider — and it silently hangs from this network
+    # position: TCP/TLS connects fine, then no HTTP response ever arrives.
+    # Confirmed directly, repeatedly: `curl` to the CDX endpoint hung 12s+ with
+    # zero response while archive.org's own homepage answered in ~90ms; gau
+    # with `--providers wayback` still hung past 50s even with explicit
+    # `--timeout 15 --retries 1` flags (gau 2.2.4's client-side timeout does
+    # not bound this particular hang — a real gau/Go-http-client limitation,
+    # not a config gap); `gau --providers commoncrawl,otx,urlscan` (wayback
+    # excluded) completed cleanly in seconds every time. `waybackurls` has no
+    # provider other than wayback, so it can't be worked around the same way.
+    # Fix: skip `waybackurls` and gau's `wayback` provider entirely, keep
+    # gau's other three providers. PROVIDER_TIMEOUT + run_shell_to_file's
+    # process-group kill remain as defense-in-depth in case commoncrawl/otx/
+    # urlscan ever hang too — a hang now fails fast and clean instead of
+    # leaking an orphaned process that (repeated over a long multi-host run)
+    # was the real path to memory exhaustion on this box's tiny 1.9GB/no-swap
+    # ceiling. Streamed straight to disk (run_shell_to_file), not captured
+    # through a Python PIPE — output for a large multi-subdomain target can be
+    # hundreds of MB, and capturing that in Python memory just to rewrite it
+    # to the same file was unnecessary overhead and a real OOM contributor.
+    #
+    # UPDATE 2026-09-08: `commoncrawl` is ALSO dead from this box — its index
+    # host refuses the connection outright (`dial tcp4 54.237.141.66:80:
+    # connect: connection refused`), confirmed directly and via isolated
+    # single-provider runs. Worse, gau 2.2.4 doesn't degrade gracefully when
+    # one provider in a comma-separated list errors like this: the combined
+    # `commoncrawl,otx,urlscan` run exits 0 with EMPTY output, even though
+    # `otx,urlscan` alone (no commoncrawl) returns real results (1733 URLs in
+    # one direct test) — so this line has likely been silently returning
+    # nothing since it was written, with no visible error. Fix: drop
+    # commoncrawl, keep otx+urlscan only.
+    PROVIDER_TIMEOUT = 180
+
+    steps = [
+        (f"echo https://{domain}/", False),
+        (f"gau {domain} --threads 1 --subs --providers otx,urlscan | sort -u", True),
     ]
 
-    for cmd in commands:
+    for cmd, append in steps:
         log_info(f"Exec: {cmd}")
-        stdout, stderr, rc = run_shell(cmd, timeout=900)
-        if rc != 0:
+        rc = run_shell_to_file(cmd, temp_file, timeout=PROVIDER_TIMEOUT, append=append)
+        if rc == 124:
+            log_warn(f"Timed out after {PROVIDER_TIMEOUT}s (provider likely hung, e.g. archive.org CDX) — skipping: {cmd}")
+        elif rc != 0:
             log_err(f"Command failed ({rc}): {cmd}")
-            if stderr:
-                log_err(stderr.strip()[:300])
 
     unique_lines = set()
     with open(temp_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -470,25 +553,34 @@ def src_shodan(domain, api_key):
 
 
 def src_wayback(domain):
+    # Was `requests.get(url, timeout=20)`. Empirically confirmed (isolated
+    # test on hunt-server1: hung past a 25s hard outer kill even with
+    # timeout=20 set) that requests/urllib3's `timeout` is a PER-READ timeout,
+    # not a wall-clock total — the documented requests limitation: "timeout
+    # is not a time limit on the entire response... an exception is raised
+    # if the server has not issued a response for `timeout` seconds" between
+    # reads. archive.org's CDX endpoint apparently dribbles bytes just often
+    # enough to keep resetting that per-read clock without ever completing,
+    # so real observed hangs ran 487s-1173s despite the 20s setting. `curl
+    # --max-time` is a true wall-clock deadline regardless of partial data
+    # trickling in, so shell out to curl via the process-group-safe
+    # run_shell() instead of using `requests` for this specific call.
     url = (f"http://web.archive.org/cdx/search/cdx?"
            f"url=*.{domain}/*&output=txt&fl=original&collapse=urlkey")
-    try:
-        r = requests.get(url, timeout=120)
-        if r.status_code != 200:
-            log_warn(f"wayback returned {r.status_code}")
-            return []
-        results = set()
-        for line in r.text.splitlines():
-            try:
-                host = urlparse(line.strip()).hostname
-                if host:
-                    results.add(host)
-            except Exception:
-                continue
-        return list(results)
-    except Exception as e:
-        log_warn(f"wayback failed: {e}")
+    cmd = f"curl -sS --max-time 20 {shlex.quote(url)}"
+    stdout, stderr, rc = run_shell(cmd, timeout=25)
+    if rc != 0:
+        log_warn(f"wayback failed (rc={rc}): {stderr.strip()[:150] if stderr else 'curl timeout/error'}")
         return []
+    results = set()
+    for line in stdout.splitlines():
+        try:
+            host = urlparse(line.strip()).hostname
+            if host:
+                results.add(host)
+        except Exception:
+            continue
+    return list(results)
 
 
 def src_alienvault(domain):
@@ -502,6 +594,33 @@ def src_alienvault(domain):
     except Exception as e:
         log_warn(f"alienvault failed: {e}")
         return []
+
+
+def src_gau(domain, tmpdir):
+    # Subs-stage counterpart to run_passive()'s gau call: same wayback-hang
+    # workaround (archive.org's CDX API silently hangs from this box's
+    # network position — see run_passive's comment) AND the same dead-
+    # commoncrawl workaround (connection refused from this box; also
+    # confirmed to silently zero the WHOLE combined-provider run rather than
+    # degrading gracefully — see run_passive's 2026-09-08 update comment).
+    # Only otx/urlscan providers are used. Streamed to disk via
+    # run_shell_to_file rather than captured in a Python PIPE — gau's URL
+    # dump for a large target can be large enough to be a real memory
+    # concern on this box (see run_shell_to_file's own docstring).
+    out = Path(tmpdir) / "gau.txt"
+    cmd = f"gau {domain} --threads 1 --subs --providers otx,urlscan | sort -u"
+    rc = run_shell_to_file(cmd, out, timeout=180)
+    if rc != 0:
+        log_warn(f"gau rc={rc}")
+    results = set()
+    for line in _read_lines(out):
+        try:
+            host = urlparse(line).hostname
+            if host:
+                results.add(host)
+        except Exception:
+            continue
+    return list(results)
 
 
 def src_hackertarget(domain):
@@ -543,6 +662,7 @@ def run_subdomain_enum(domain, output_dir, shodan_key, oos_patterns,
             ("shodan",       lambda: src_shodan(domain, shodan_key)),
             ("wayback",      lambda: src_wayback(domain)),
             ("alienvault",   lambda: src_alienvault(domain)),
+            ("gau",          lambda: src_gau(domain, tmpdir)),
             ("hackertarget", lambda: src_hackertarget(domain)),
         ]
 
@@ -611,21 +731,20 @@ def run_passiveplus(domain, output_dir, threads):
     )
 
     log_info(f"Exec: {cmd}")
-    stdout, stderr, rc = run_shell(cmd, timeout=1800)
+    out_file = os.path.join(output_dir, "passiveplus.txt")
+    rc = run_shell_to_file(cmd, out_file, timeout=1800)
 
-    if rc != 0 and not stdout:
+    if rc == 124:
+        log_err("PassivePlus (httpx) timed out after 1800s.")
+        return 0
+    if rc != 0 or not os.path.isfile(out_file):
         log_err("PassivePlus failed.")
-        if stderr:
-            log_err(stderr.strip()[:300])
         return 0
 
-    lines = [l for l in stdout.splitlines() if l.strip()]
-    out_file = os.path.join(output_dir, "passiveplus.txt")
-    with open(out_file, "w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(line + "\n")
-    log_ok(f"PassivePlus saved: {out_file} ({len(lines)} lines)")
-    return len(lines)
+    with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+        count = sum(1 for line in f if line.strip())
+    log_ok(f"PassivePlus saved: {out_file} ({count} lines)")
+    return count
 
 
 # ================== PARAMS ==================
@@ -636,27 +755,27 @@ def extract_params(output_dir):
         return 0
 
     log_step("Extracting parameter keys with unfurl")
+    out_file = os.path.join(output_dir, "passive_params.txt")
     cmd = f"cat {passive_file} | unfurl keys | sort -u"
     log_info(f"Exec: {cmd}")
-    stdout, stderr, rc = run_shell(cmd, timeout=300)
+    # Streamed straight to disk, not captured through Python — on a large
+    # target passive.txt (evernote-com alone is 38k lines/2.7MB; big orgs with
+    # thousands of subdomains can be far larger) capturing unfurl's full output
+    # as a Python string just to immediately rewrite it to a file was pure
+    # unnecessary memory overhead, and the actual OOM risk on constrained hosts.
+    rc = run_shell_to_file(cmd, out_file, timeout=300)
 
-    if rc != 0 and not stdout:
-        log_err("unfurl failed.")
-        if stderr:
-            log_err(stderr.strip()[:300])
+    if rc == 124:
+        log_err(f"unfurl timed out after 300s on {passive_file} — check file isn't corrupted/unbounded.")
+        return 0
+    if rc != 0 or not os.path.isfile(out_file) or os.path.getsize(out_file) == 0:
+        log_err("unfurl failed or produced no params.")
         return 0
 
-    keys = [l.strip() for l in stdout.splitlines() if l.strip()]
-    if not keys:
-        log_err("No params extracted.")
-        return 0
-
-    out_file = os.path.join(output_dir, "passive_params.txt")
-    with open(out_file, "w", encoding="utf-8") as f:
-        for k in keys:
-            f.write(k + "\n")
-    log_ok(f"Params saved: {out_file} ({len(keys)} keys)")
-    return len(keys)
+    with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
+        count = sum(1 for _ in f)
+    log_ok(f"Params saved: {out_file} ({count} keys)")
+    return count
 
 
 # ================== ACTIVE ==================
@@ -913,10 +1032,17 @@ def show_state(out_dir, domain):
     print()
 
 
-def should_run(out_dir, stage, force=False):
+def should_run(out_dir, stage, force=False, no_interactive=False):
     """
     Return True if the stage should run.
-    If already done and not forced, ask user whether to re-run.
+    If already done and not forced, ask user whether to re-run — unless
+    no_interactive is set, in which case there is no stdin to read from a
+    scripted/CI/SSH-heredoc invocation, and calling input() here raised a
+    raw EOFError traceback instead of a clean skip (confirmed: run-wrecon.sh
+    passes --no-interactive but this prompt fired anyway on a second run
+    against the same project, since --no-interactive was never threaded down
+    to this specific check). Skip = same as the interactive default (False),
+    just without blocking on a read that can never succeed.
     """
     if force or not is_done(out_dir, stage):
         return True
@@ -924,6 +1050,9 @@ def should_run(out_dir, stage, force=False):
     ts    = info.get("finished_at", "?")
     count = info.get("count", "?")
     log_warn(f"Stage '{stage}' already done: {count} results @ {ts}")
+    if no_interactive:
+        log_info(f"  --no-interactive: skipping re-run of '{stage}' (use --force to re-run non-interactively)")
+        return False
     return ask_yn(f"  Re-run {stage}?", default=False)
 
 
@@ -1045,6 +1174,7 @@ def execute(opts):
     threads    = opts["threads"]
     resolvers  = opts["resolvers"]
     force      = opts.get("force", False)
+    no_interactive = opts.get("no_interactive", False)
 
     ensure_dir(out_dir)
     oos_patterns = load_oos(oos_file)
@@ -1064,23 +1194,23 @@ def execute(opts):
           f"╔══ Running on {domain} ══╗{Colors.RESET}")
     start = time.time()
 
-    if opts["do_subs"] and should_run(out_dir, "subs", force):
+    if opts["do_subs"] and should_run(out_dir, "subs", force, no_interactive):
         count = run_subdomain_enum(domain, out_dir, shodan_key, oos_patterns)
         mark_done(out_dir, "subs", count)
 
-    if opts["do_passive"] and should_run(out_dir, "passive", force):
+    if opts["do_passive"] and should_run(out_dir, "passive", force, no_interactive):
         count = run_passive(domain, out_dir, oos_patterns)
         mark_done(out_dir, "passive", count)
 
-    if opts["do_params"] and should_run(out_dir, "params", force):
+    if opts["do_params"] and should_run(out_dir, "params", force, no_interactive):
         count = extract_params(out_dir)
         mark_done(out_dir, "params", count)
 
-    if opts["do_pplus"] and should_run(out_dir, "pplus", force):
+    if opts["do_pplus"] and should_run(out_dir, "pplus", force, no_interactive):
         count = run_passiveplus(domain, out_dir, threads)
         mark_done(out_dir, "pplus", count)
 
-    if opts["do_active"] and should_run(out_dir, "active", force):
+    if opts["do_active"] and should_run(out_dir, "active", force, no_interactive):
         count = run_active(domain, out_dir, resolvers, threads, oos_patterns)
         mark_done(out_dir, "active", count)
 
@@ -1184,6 +1314,7 @@ def main():
             "do_params": args.params, "do_pplus": args.passiveplus,
             "do_active": args.active,
             "force": args.force,
+            "no_interactive": args.no_interactive,
         }
 
         # --tmux: launch inside tmux session
