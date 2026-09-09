@@ -418,16 +418,29 @@ def run_passive(domain, output_dir, oos_patterns):
     # hundreds of MB, and capturing that in Python memory just to rewrite it
     # to the same file was unnecessary overhead and a real OOM contributor.
     #
-    # UPDATE 2026-09-08: `commoncrawl` is ALSO dead from this box — its index
-    # host refuses the connection outright (`dial tcp4 54.237.141.66:80:
-    # connect: connection refused`), confirmed directly and via isolated
-    # single-provider runs. Worse, gau 2.2.4 doesn't degrade gracefully when
-    # one provider in a comma-separated list errors like this: the combined
+    # UPDATE 2026-09-08/09: `commoncrawl` is unreachable specifically FROM
+    # THIS BOX — NOT a dead/down provider (correction: an earlier version of
+    # this comment claimed it was dead globally; that was wrong). TCP to
+    # index.commoncrawl.org:80 (54.237.141.66) connects cleanly (confirmed
+    # with mtr: 0% loss, clean path all 10 hops) but the HTTP request gets an
+    # empty reply — an application-layer drop, not a routing/firewall issue
+    # (hunt-server1's own outbound iptables is policy ACCEPT, no rules). Most
+    # likely commoncrawl's edge (nginx/WAF) is blocklisting this box's
+    # hosting-provider IP range. From an unrelated residential/different
+    # network, the exact same request returns a clean 200 with real data
+    # (verified 2026-09-09). Also: gau 2.2.4 doesn't degrade gracefully when
+    # one provider in a comma-separated list fails like this: the combined
     # `commoncrawl,otx,urlscan` run exits 0 with EMPTY output, even though
     # `otx,urlscan` alone (no commoncrawl) returns real results (1733 URLs in
-    # one direct test) — so this line has likely been silently returning
-    # nothing since it was written, with no visible error. Fix: drop
-    # commoncrawl, keep otx+urlscan only.
+    # one direct test) — so this line was likely silently returning nothing
+    # since it was written, with no visible error. Practical fix here: drop
+    # commoncrawl, keep otx+urlscan only. CAVEAT: commoncrawl is normally the
+    # single biggest URL-volume source (833 URLs for traveloka.com alone from
+    # commoncrawl vs. 93 from otx+urlscan combined, in direct comparison) —
+    # dropping it is a real coverage loss, not a wash. When thorough passive
+    # coverage matters, run `gau <domain> --subs --providers commoncrawl`
+    # from a network egress that isn't this box (confirmed working from an
+    # unrelated network) and merge the results in by hand.
     PROVIDER_TIMEOUT = 180
 
     steps = [
