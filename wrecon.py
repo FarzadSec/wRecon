@@ -706,13 +706,22 @@ def run_subdomain_enum(domain, output_dir, shodan_key, oos_patterns,
 
     in_scope, oos_hits = filter_oos_list(all_subs, oos_patterns)
 
+    # NOTE: "\n".join(...) never adds a trailing newline after the last
+    # element. That silently turns every one of these files into a landmine
+    # for any later `cat file1 file2 | sort -u` — file1's last line and
+    # file2's first line glue into one garbage entry with no error or
+    # warning. This is exactly what caused a real incident: 4 hostnames
+    # silently merged into 4 nonsense lines in an earlier manual merge of
+    # this same output (2026-09-08), and it bit an automated merge step
+    # again in a downstream wrapper script the very next day. Trailing "\n"
+    # on every write closes this off at the source.
     ensure_dir(output_dir)
     (Path(output_dir) / "all_subdomains.txt").write_text(
-        "\n".join(sorted(all_subs)))
+        "\n".join(sorted(all_subs)) + ("\n" if all_subs else ""))
     (Path(output_dir) / "subdomains.txt").write_text(
-        "\n".join(sorted(in_scope)))
+        "\n".join(sorted(in_scope)) + ("\n" if in_scope else ""))
     (Path(output_dir) / "subdomains_oos.txt").write_text(
-        "\n".join(sorted(oos_hits)))
+        "\n".join(sorted(oos_hits)) + ("\n" if oos_hits else ""))
     (Path(output_dir) / "subdomains_by_source.json").write_text(
         json.dumps(sources_results, indent=2))
 
